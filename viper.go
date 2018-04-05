@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	yaml "gopkg.in/yaml.v2"
@@ -260,13 +261,14 @@ func (v *Viper) OnConfigChange(run func(in fsnotify.Event)) {
 
 func WatchConfig() { v.WatchConfig() }
 func (v *Viper) WatchConfig() {
+	wg := sync.WaitGroup{}
+	wg.Add(1)
 	go func() {
 		watcher, err := fsnotify.NewWatcher()
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer watcher.Close()
-
 		// we have to watch the entire directory to pick up renames/atomic saves in a cross-platform way
 		filename, err := v.getConfigFile()
 		if err != nil {
@@ -276,31 +278,46 @@ func (v *Viper) WatchConfig() {
 
 		configFile := filepath.Clean(filename)
 		configDir, _ := filepath.Split(configFile)
+		realConfigFile, _ := filepath.EvalSymlinks(filename)
 
 		done := make(chan bool)
 		go func() {
+			loop:
 			for {
 				select {
 				case event := <-watcher.Events:
-					// we only care about the config file
-					if filepath.Clean(event.Name) == configFile {
-						if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
-							err := v.ReadInConfig()
-							if err != nil {
-								log.Println("error:", err)
-							}
+					currentConfigFile, _ := filepath.EvalSymlinks(filename)
+				// we only care about the config file with the following cases:
+				// 1 - if the config file was modified or created
+				// 2 - if the real path to the config file changed (eg: k8s ConfigMap replacement)
+					if (filepath.Clean(event.Name) == configFile &&
+						(event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create)) ||
+						(currentConfigFile != "" && currentConfigFile != realConfigFile) {
+						realConfigFile = currentConfigFile
+						err := v.ReadInConfig()
+						if err != nil {
+							log.Println("error reading file:", err.Error())
+						}
+						if v.onConfigChange != nil {
 							v.onConfigChange(event)
 						}
+					} else if filepath.Clean(event.Name) == configFile &&
+						event.Op&fsnotify.Remove == fsnotify.Remove {
+						done <- true
+						break loop
 					}
+
 				case err := <-watcher.Errors:
-					log.Println("error:", err)
+					log.Printf("watcher error: %v\n", err)
 				}
 			}
 		}()
-
 		watcher.Add(configDir)
-		<-done
+		wg.Done() // done initalizing the watch in this go routine, so the parent routine can move on...
+		<-done    // block until the watched file is removed...
 	}()
+	// make sure that the go routine above fully started before returning
+	wg.Wait()
 }
 
 // SetConfigFile explicitly defines the path, name and extension of the config file.
@@ -500,7 +517,7 @@ func (v *Viper) searchMapWithPathPrefixes(source map[string]interface{}, path []
 				// if the type of `next` is the same as the type being asserted
 				val = v.searchMapWithPathPrefixes(next.(map[string]interface{}), path[i:])
 			default:
-				// got a value but nested key expected, do nothing and look for next prefix
+			// got a value but nested key expected, do nothing and look for next prefix
 			}
 			if val != nil {
 				return val
@@ -1401,7 +1418,7 @@ func keyExists(k string, m map[string]interface{}) string {
 }
 
 func castToMapStringInterface(
-	src map[interface{}]interface{}) map[string]interface{} {
+src map[interface{}]interface{}) map[string]interface{} {
 	tgt := map[string]interface{}{}
 	for k, v := range src {
 		tgt[fmt.Sprintf("%v", k)] = v
@@ -1431,7 +1448,7 @@ func castMapFlagToMapInterface(src map[string]FlagValue) map[string]interface{} 
 // deep. Both map types are supported as there is a go-yaml fork that uses
 // `map[string]interface{}` instead.
 func mergeMaps(
-	src, tgt map[string]interface{}, itgt map[interface{}]interface{}) {
+src, tgt map[string]interface{}, itgt map[interface{}]interface{}) {
 	for sk, sv := range src {
 		tk := keyExists(sk, tgt)
 		if tk == "" {
@@ -1636,7 +1653,7 @@ func (v *Viper) flattenAndMergeMap(shadow map[string]bool, m map[string]interfac
 // shadowed by values from the first map.
 func (v *Viper) mergeFlatMap(shadow map[string]bool, m map[string]interface{}) map[string]bool {
 	// scan keys
-outer:
+	outer:
 	for k, _ := range m {
 		path := strings.Split(k, v.keyDelim)
 		// scan intermediate paths
@@ -1720,14 +1737,18 @@ func (v *Viper) getConfigType() string {
 }
 
 func (v *Viper) getConfigFile() (string, error) {
-	if v.configFile == "" {
-		cf, err := v.findConfigFile()
-		if err != nil {
-			return "", err
-		}
-		v.configFile = cf
+	// if explicitly set, then use it
+	if v.configFile != "" {
+		return v.configFile, nil
 	}
-	return v.configFile, nil
+
+	cf, err := v.findConfigFile()
+	if err != nil {
+		return "", err
+	}
+
+	v.configFile = cf
+	return v.getConfigFile()
 }
 
 func (v *Viper) searchInPath(in string) (filename string) {
